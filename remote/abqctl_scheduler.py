@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""HPC-side nohup scheduler: lease + resource-aware job dispatch."""
-from __future__ import annotations
+"""HPC-side nohup scheduler. Compatible with Python 3.6+."""
+from __future__ import print_function
 
 import os
 import signal
@@ -9,7 +9,6 @@ import sys
 import time
 from pathlib import Path
 
-# local imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import abqctl_db as db  # noqa: E402
 import abqctl_node_scan as scan  # noqa: E402
@@ -28,31 +27,32 @@ _owner = ""
 _stop = False
 
 
-def log(msg: str) -> None:
-    print(f"{LOG_PREFIX} {msg}", flush=True)
+def log(msg):
+    sys.stdout.write("%s %s\n" % (LOG_PREFIX, msg))
+    sys.stdout.flush()
 
 
-def handle_signal(signum, frame) -> None:  # noqa: ARG001
+def handle_signal(signum, frame):
     global _stop
     _stop = True
-    log(f"signal {signum}; stopping")
+    log("signal %s; stopping" % signum)
 
 
-def write_pid() -> None:
+def write_pid():
     Path(QUEUE_DIR).mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
 
 
-def clear_stop_flag() -> None:
+def clear_stop_flag():
     if STOP_FLAG.exists():
         STOP_FLAG.unlink()
 
 
-def should_stop() -> bool:
+def should_stop():
     return _stop or STOP_FLAG.exists()
 
 
-def gather_snapshots() -> list[dict]:
+def gather_snapshots():
     me = scan.hostname()
     out = []
     for n in NODES:
@@ -65,13 +65,13 @@ def gather_snapshots() -> list[dict]:
     return out
 
 
-def free_cpus(snap: dict) -> float:
+def free_cpus(snap):
     ncpu = int(snap.get("ncpu") or 0)
     used = int(snap.get("used_cpus") or 0)
     return max(0.0, ncpu * CPU_FACTOR - used)
 
 
-def pick_node(job: dict, snaps: list[dict]) -> str | None:
+def pick_node(job, snaps):
     prefer = job.get("prefer_node")
     need = int(job.get("cpus") or 8)
     candidates = []
@@ -87,15 +87,12 @@ def pick_node(job: dict, snaps: list[dict]) -> str | None:
             continue
         candidates.append((free_cpus(s), node, s))
     if not candidates:
-        # if prefer set and failed, do not fall back unless prefer empty
-        if prefer:
-            return None
         return None
     candidates.sort(key=lambda x: -x[0])
     return candidates[0][1]
 
 
-def start_abaqus_on_node(job: dict, node: str) -> tuple[bool, str, int | None, str]:
+def start_abaqus_on_node(job, node):
     """Start via SSH to node (or local). Returns ok, message, pid, job_name."""
     inp = job["inp"]
     cpus = int(job["cpus"])
@@ -103,33 +100,51 @@ def start_abaqus_on_node(job: dict, node: str) -> tuple[bool, str, int | None, s
     job_name = Path(inp).stem
     me = scan.hostname()
 
-    remote_cmd = f"""
+    # Per-job workdir: <parent>/<job_name>/ so many .inp in one folder stay isolated.
+    # If the .inp already lives in a folder named after the job, reuse that folder.
+    remote_cmd = """
 set -e
 source "$HOME/software/abaqus2020.env" 2>/dev/null || true
-INP='{inp}'
+INP='%s'
 test -r "$INP"
-WD=$(dirname "$INP")
-JOB='{job_name}'
-CPUS={cpus}
-DBL='{double_mode}'
+INP=$(readlink -f "$INP")
+PARENT=$(dirname "$INP")
+JOB='%s'
+CPUS=%s
+DBL='%s'
+if [ "$(basename "$PARENT")" = "$JOB" ]; then
+  WD="$PARENT"
+else
+  WD="$PARENT/$JOB"
+fi
+mkdir -p "$WD/scratch"
+# Keep a stable name inside workdir; prefer symlink so *INCLUDE paths still resolve via real file.
+if [ "$INP" != "$WD/${JOB}.inp" ]; then
+  ln -sfn "$INP" "$WD/${JOB}.inp" 2>/dev/null || cp -f "$INP" "$WD/${JOB}.inp"
+fi
 cd "$WD"
-mkdir -p scratch
-rm -f "${{JOB}}.lck" 2>/dev/null || true
+rm -f "${JOB}.lck" 2>/dev/null || true
 export OMP_NUM_THREADS=$CPUS OMP_DYNAMIC=FALSE
-setsid nohup abaqus job="$JOB" input="$(basename "$INP")" \\
+setsid nohup abaqus job="$JOB" input="${JOB}.inp" \\
   cpus="$CPUS" mp_mode=threads double="$DBL" \\
   scratch="$WD/scratch" interactive \\
-  > "run_${{JOB}}.log" 2>&1 < /dev/null &
-echo $! > "run_${{JOB}}.pid"
-echo STARTED:$JOB:$(cat "run_${{JOB}}.pid"):$(hostname)
-"""
+  > "run_${JOB}.log" 2>&1 < /dev/null &
+echo $! > "run_${JOB}.pid"
+echo WORKDIR:$WD
+echo STARTED:$JOB:$(cat "run_${JOB}.pid"):$(hostname)
+""" % (
+        inp.replace("'", "'\\''"),
+        job_name.replace("'", "'\\''"),
+        cpus,
+        double_mode.replace("'", "'\\''"),
+    )
 
     if node == me or node in me:
         p = subprocess.run(
             ["bash", "-lc", remote_cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            universal_newlines=True,
             timeout=120,
             check=False,
         )
@@ -151,7 +166,7 @@ echo STARTED:$JOB:$(cat "run_${{JOB}}.pid"):$(hostname)
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            universal_newlines=True,
             timeout=120,
             check=False,
         )
@@ -169,14 +184,15 @@ echo STARTED:$JOB:$(cat "run_${{JOB}}.pid"):$(hostname)
     return False, out[-800:] or "start failed", None, job_name
 
 
-def job_still_running(job: dict) -> bool:
+def job_still_running(job):
     node = job.get("node") or ""
     name = job.get("job_name") or ""
     if not name:
         return False
     me = scan.hostname()
     check = (
-        f"pgrep -af 'analysis.pyc -job {name}( |$)|job={name}( |$)|/{name}\\.com' >/dev/null"
+        "pgrep -af 'analysis.pyc -job %s( |$)|job=%s( |$)|/%s\\.com' >/dev/null"
+        % (name, name, name)
     )
     if node == me or node in me:
         return subprocess.run(["bash", "-lc", check], check=False).returncode == 0
@@ -197,17 +213,20 @@ def job_still_running(job: dict) -> bool:
     return r.returncode == 0
 
 
-def reclaim_finished() -> None:
+def reclaim_finished():
     for job in db.list_running_tracked(QUEUE_DIR):
         try:
             if not job_still_running(job):
-                log(f"job id={job['id']} name={job.get('job_name')} finished -> done")
+                log(
+                    "job id=%s name=%s finished -> done"
+                    % (job["id"], job.get("job_name"))
+                )
                 db.mark_done(job["id"], QUEUE_DIR)
         except Exception as e:
-            log(f"reclaim error id={job.get('id')}: {e}")
+            log("reclaim error id=%s: %s" % (job.get("id"), e))
 
 
-def _revert_to_waiting(job_id: int, note: str) -> None:
+def _revert_to_waiting(job_id, note):
     conn = db.connect(QUEUE_DIR)
     try:
         conn.execute(
@@ -222,7 +241,7 @@ def _revert_to_waiting(job_id: int, note: str) -> None:
         conn.close()
 
 
-def dispatch_one(snaps: list[dict]) -> bool:
+def dispatch_one(snaps):
     """FIFO: only claim head when a node currently fits; else wait next loop."""
     waiting = db.list_jobs(status="waiting", limit=1, queue_dir=QUEUE_DIR)
     if not waiting:
@@ -235,25 +254,30 @@ def dispatch_one(snaps: list[dict]) -> bool:
     claimed = db.claim_next_job(QUEUE_DIR)
     if not claimed:
         return False
-    # Head may have changed between peek and claim
     if claimed["id"] != head["id"]:
         node = pick_node(claimed, snaps)
         if not node:
             _revert_to_waiting(claimed["id"], "no node with enough free CPUs; waiting")
             return False
 
-    log(f"starting id={claimed['id']} inp={claimed['inp']} cpus={claimed['cpus']} node={node}")
+    log(
+        "starting id=%s inp=%s cpus=%s node=%s"
+        % (claimed["id"], claimed["inp"], claimed["cpus"], node)
+    )
     ok, msg, pid, job_name = start_abaqus_on_node(claimed, node)
     if ok and pid:
         db.mark_running(claimed["id"], node, pid, job_name, QUEUE_DIR)
-        log(f"running id={claimed['id']} pid={pid} job={job_name} node={node}")
+        log(
+            "running id=%s pid=%s job=%s node=%s"
+            % (claimed["id"], pid, job_name, node)
+        )
         return True
     db.mark_failed(claimed["id"], msg or "start failed", QUEUE_DIR)
-    log(f"failed id={claimed['id']}: {msg[:200]}")
+    log("failed id=%s: %s" % (claimed["id"], (msg or "")[:200]))
     return False
 
 
-def main() -> int:
+def main():
     global _owner
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -262,14 +286,14 @@ def main() -> int:
     write_pid()
     clear_stop_flag()
     host = scan.hostname()
-    _owner = f"{host}:{os.getpid()}"
+    _owner = "%s:%s" % (host, os.getpid())
 
     if not db.lease_try_acquire(_owner, LEASE_SEC, QUEUE_DIR):
         st = db.lease_status(QUEUE_DIR)
-        log(f"lease held by {st}; exit")
+        log("lease held by %s; exit" % st)
         return 0
 
-    log(f"started owner={_owner} nodes={NODES} interval={INTERVAL}s")
+    log("started owner=%s nodes=%s interval=%ss" % (_owner, NODES, INTERVAL))
     while not should_stop():
         if not db.lease_renew(_owner, LEASE_SEC, QUEUE_DIR):
             log("lost lease; exit")
@@ -278,10 +302,9 @@ def main() -> int:
             db.requeue_stale_starting(120, QUEUE_DIR)
             snaps = gather_snapshots()
             reclaim_finished()
-            # dispatch up to free slots (max 1 per loop by default for predictability)
             dispatch_one(snaps)
         except Exception as e:
-            log(f"loop error: {e}")
+            log("loop error: %s" % e)
         for _ in range(INTERVAL):
             if should_stop():
                 break

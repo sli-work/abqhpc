@@ -128,6 +128,9 @@ function Ensure-SshNet {
     if (-not ([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'Renci.SshNet' })) {
         Add-Type -Path $SshNetDll
     }
+    if (('AbqCtl.SshAuthHelper' -as [type]) -and -not ('AbqCtl.ResumeDownload' -as [type])) {
+        throw '当前进程加载了旧版 SSH 组件。请关闭面板后重新打开，再连接，以启用断点续传下载。'
+    }
     if (-not ('AbqCtl.SshAuthHelper' -as [type])) {
         $ref = [Renci.SshNet.SshClient].Assembly.Location
         Add-Type -ReferencedAssemblies @($ref, 'System.Core') -TypeDefinition @'
@@ -168,13 +171,16 @@ namespace AbqCtl {
   }
 
   // Counts bytes as SSH.NET reads/writes the stream — reliable even if UploadFile callback is sparse.
+  // baseOffset: already-transferred bytes (resume); callback reports base+new.
   public sealed class ProgressStream : Stream {
     readonly Stream _inner;
     readonly Action<ulong> _cb;
     long _count;
+    readonly long _base;
     readonly bool _ownInner;
-    public ProgressStream(Stream inner, Action<ulong> cb, bool ownInner) {
-      _inner = inner; _cb = cb; _ownInner = ownInner;
+    public ProgressStream(Stream inner, Action<ulong> cb, bool ownInner) : this(inner, cb, ownInner, 0) {}
+    public ProgressStream(Stream inner, Action<ulong> cb, bool ownInner, long baseOffset) {
+      _inner = inner; _cb = cb; _ownInner = ownInner; _base = baseOffset < 0 ? 0 : baseOffset;
     }
     public override bool CanRead { get { return _inner.CanRead; } }
     public override bool CanSeek { get { return _inner.CanSeek; } }
@@ -191,7 +197,7 @@ namespace AbqCtl {
       int n = _inner.Read(buffer, offset, count);
       if (n > 0) {
         _count += n;
-        if (_cb != null) _cb((ulong)_count);
+        if (_cb != null) _cb((ulong)(_base + _count));
       }
       return n;
     }
@@ -199,12 +205,111 @@ namespace AbqCtl {
       _inner.Write(buffer, offset, count);
       if (count > 0) {
         _count += count;
-        if (_cb != null) _cb((ulong)_count);
+        if (_cb != null) _cb((ulong)(_base + _count));
       }
     }
     protected override void Dispose(bool disposing) {
       if (disposing && _ownInner) _inner.Dispose();
       base.Dispose(disposing);
+    }
+  }
+
+  public static class ResumeDownload {
+    const int BufSize = 256 * 1024;
+
+    public static long DownloadFile(SftpClient sftp, string remote, string local, Action<ulong> onBytes) {
+      if (!sftp.Exists(remote)) throw new Exception("remote file missing: " + remote);
+      long total = (long)sftp.GetAttributes(remote).Size;
+      long offset = 0;
+      if (File.Exists(local)) {
+        offset = new FileInfo(local).Length;
+        if (offset == total && total > 0) {
+          if (onBytes != null) onBytes((ulong)total);
+          return total;
+        }
+        if (offset > total) {
+          File.Delete(local);
+          offset = 0;
+        }
+      }
+      string dir = Path.GetDirectoryName(local);
+      if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+      using (var remoteStream = sftp.OpenRead(remote)) {
+        if (offset > 0) remoteStream.Seek(offset, SeekOrigin.Begin);
+        var mode = offset > 0 ? FileMode.OpenOrCreate : FileMode.Create;
+        using (var fs = new FileStream(local, mode, FileAccess.Write, FileShare.Read)) {
+          if (offset > 0) fs.Seek(offset, SeekOrigin.Begin);
+          var buf = new byte[BufSize];
+          long done = offset;
+          if (onBytes != null) onBytes((ulong)done);
+          int n;
+          while ((n = remoteStream.Read(buf, 0, buf.Length)) > 0) {
+            fs.Write(buf, 0, n);
+            done += n;
+            if (onBytes != null) onBytes((ulong)done);
+          }
+          fs.Flush();
+        }
+      }
+      long finalLen = new FileInfo(local).Length;
+      if (total > 0 && finalLen != total) {
+        throw new Exception(string.Format("size mismatch local={0} remote={1}", finalLen, total));
+      }
+      return finalLen;
+    }
+
+    static void CollectFiles(SftpClient sftp, string remoteDir, string prefix, System.Collections.Generic.List<object[]> sink) {
+      foreach (var e in sftp.ListDirectory(remoteDir)) {
+        if (e.Name == "." || e.Name == "..") continue;
+        string rel = string.IsNullOrEmpty(prefix) ? e.Name : (prefix + "/" + e.Name);
+        if (e.IsDirectory) CollectFiles(sftp, e.FullName.Replace("\\", "/"), rel, sink);
+        else if (e.IsRegularFile) sink.Add(new object[] { e.FullName.Replace("\\", "/"), rel, (long)e.Length });
+      }
+    }
+
+    public static long MeasureDirectory(SftpClient sftp, string remoteDir) {
+      remoteDir = remoteDir.TrimEnd('/');
+      var files = new System.Collections.Generic.List<object[]>();
+      CollectFiles(sftp, remoteDir, "", files);
+      long grand = 0;
+      for (int i = 0; i < files.Count; i++) grand += (long)files[i][2];
+      return grand;
+    }
+
+    // Returns "files=N bytes=B skipped=S local=..."
+    public static string DownloadDirectory(SftpClient sftp, string remoteDir, string localRoot, Action<ulong> onBytes) {
+      remoteDir = remoteDir.TrimEnd('/');
+      var files = new System.Collections.Generic.List<object[]>();
+      CollectFiles(sftp, remoteDir, "", files);
+      long grand = 0;
+      for (int i = 0; i < files.Count; i++) grand += (long)files[i][2];
+      long transferred = 0;
+      int skipped = 0;
+      string leaf = Path.GetFileName(remoteDir);
+      string destRoot = Path.Combine(localRoot, leaf);
+      for (int i = 0; i < files.Count; i++) {
+        string rem = (string)files[i][0];
+        string rel = (string)files[i][1];
+        long sz = (long)files[i][2];
+        string local = Path.Combine(destRoot, rel.Replace('/', Path.DirectorySeparatorChar));
+        if (File.Exists(local)) {
+          long already = new FileInfo(local).Length;
+          if (already == sz && sz >= 0) {
+            skipped++;
+            transferred += sz;
+            if (onBytes != null) onBytes((ulong)transferred);
+            continue;
+          }
+        }
+        long baseDone = transferred;
+        DownloadFile(sftp, rem, local, delegate(ulong fileDone) {
+          if (onBytes != null) onBytes((ulong)(baseDone + (long)fileDone));
+        });
+        transferred = baseDone + sz;
+        if (onBytes != null) onBytes((ulong)transferred);
+      }
+      return string.Format("files={0} bytes={1} skipped={2} local={3}", files.Count, grand, skipped, destRoot);
     }
   }
 
@@ -669,21 +774,14 @@ function Start-SessionHost([string]$PipeName) {
                         'get' {
                             $remote = ([string]$req.remote) -replace '\\', '/'
                             $local = [string]$req.local
-                            $dir = Split-Path -Parent $local
-                            if ($dir -and -not (Test-Path $dir)) {
-                                New-Item -ItemType Directory -Force -Path $dir | Out-Null
-                            }
                             if (-not $sftp.IsConnected) { throw 'SFTP 已断开' }
                             if (-not $sftp.Exists($remote)) { throw "远端文件不存在: $remote" }
                             $total = [long]$sftp.GetAttributes($remote).Size
-                            [AbqCtl.XferProgress]::Begin($XferProgressFile, 'get', 'download', $remote, $local, $total, '开始下载')
-                            $fs = [IO.File]::Open($local, [IO.FileMode]::Create, [IO.FileAccess]::Write)
-                            $pfs = New-Object AbqCtl.ProgressStream($fs, [AbqCtl.XferProgress]::Callback, $true)
-                            try { $sftp.DownloadFile($remote, $pfs, $null) }
-                            finally { $pfs.Dispose() }
-                            $len = (Get-Item -LiteralPath $local).Length
+                            $resumeHint = if ((Test-Path -LiteralPath $local) -and ((Get-Item -LiteralPath $local).Length -gt 0) -and ((Get-Item -LiteralPath $local).Length -lt $total)) { 'resume' } else { 'download' }
+                            [AbqCtl.XferProgress]::Begin($XferProgressFile, 'get', $resumeHint, $remote, $local, $total, $(if ($resumeHint -eq 'resume') { '断点续传' } else { '开始下载' }))
+                            $len = [AbqCtl.ResumeDownload]::DownloadFile($sftp, $remote, $local, [AbqCtl.XferProgress]::Callback)
                             [AbqCtl.XferProgress]::SetPhase('done', '下载完成', $len, $total)
-                            Write-HostOk ("下载完成 local={0} size={1}" -f $local, $len)
+                            Write-HostOk ("下载完成 local={0} size={1} resume={2}" -f $local, $len, ($resumeHint -eq 'resume'))
                             [AbqCtl.XferProgress]::Clear()
                         }
                         'getdir' {
@@ -692,40 +790,15 @@ function Start-SessionHost([string]$PipeName) {
                             if (-not (Test-Path -LiteralPath $localDir)) {
                                 New-Item -ItemType Directory -Force -Path $localDir | Out-Null
                             }
-                            $name = Split-Path -Leaf $remote
-                            $parent = $remote.Substring(0, $remote.LastIndexOf('/'))
-                            if (-not $parent) { $parent = '/' }
-                            $tmpRemote = "/tmp/abqctl_dl_{0}.tgz" -f ([guid]::NewGuid().ToString('N'))
-                            [AbqCtl.XferProgress]::Begin($XferProgressFile, 'getdir', 'pack', $remote, $localDir, 0, '远端打包中…')
-                            $tarCmd = "test -d '{0}' && tar -C '{1}' -czf '{2}' '{3}' && ls -l '{2}'" -f `
-                            ($remote -replace "'", "'\''"), `
-                            ($parent -replace "'", "'\''"), `
-                            ($tmpRemote -replace "'", "'\''"), `
-                            ($name -replace "'", "'\''")
-                            $pack = Invoke-SshExec $tarCmd 300
-                            if ($pack.code -ne 0) { throw "打包远端目录失败: $($pack.text)" }
-                            $total = 0L
-                            try { $total = [long]$sftp.GetAttributes($tmpRemote).Size } catch {}
-                            $tmpLocal = Join-Path $env:TEMP ("abqctl_dl_{0}.tgz" -f ([guid]::NewGuid().ToString('N')))
-                            try {
-                                [AbqCtl.XferProgress]::Begin($XferProgressFile, 'getdir', 'download', $remote, $localDir, $total, '下载压缩包…')
-                                $fs = [IO.File]::Open($tmpLocal, [IO.FileMode]::Create, [IO.FileAccess]::Write)
-                                $pfs = New-Object AbqCtl.ProgressStream($fs, [AbqCtl.XferProgress]::Callback, $true)
-                                try { $sftp.DownloadFile($tmpRemote, $pfs, $null) }
-                                finally { $pfs.Dispose() }
-                                [AbqCtl.XferProgress]::SetPhase('extract', '解压中…', $total, $total)
-                                $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
-                                if (-not $tar) { throw '本机未找到 tar.exe，无法解压远端目录包。' }
-                                & tar.exe -xzf $tmpLocal -C $localDir
-                                if ($LASTEXITCODE -ne 0) { throw "解压失败 exit=$LASTEXITCODE" }
-                                [AbqCtl.XferProgress]::SetPhase('done', '目录下载完成', $total, $total)
-                                Write-HostOk ("目录下载完成 remote={0} -> local={1}\{2}" -f $remote, $localDir, $name)
-                            }
-                            finally {
-                                Remove-Item -Force $tmpLocal -ErrorAction SilentlyContinue
-                                try { Invoke-SshExec ("rm -f '{0}'" -f ($tmpRemote -replace "'", "'\''")) 30 | Out-Null } catch {}
-                                [AbqCtl.XferProgress]::Clear()
-                            }
+                            if (-not $sftp.IsConnected) { throw 'SFTP 已断开' }
+                            if (-not $sftp.Exists($remote)) { throw "远端目录不存在: $remote" }
+                            [AbqCtl.XferProgress]::Begin($XferProgressFile, 'getdir', 'wait', $remote, $localDir, 0, '扫描远端文件…')
+                            $grand = [AbqCtl.ResumeDownload]::MeasureDirectory($sftp, $remote)
+                            [AbqCtl.XferProgress]::Begin($XferProgressFile, 'getdir', 'download', $remote, $localDir, $grand, '目录断点续传下载…')
+                            $summary = [AbqCtl.ResumeDownload]::DownloadDirectory($sftp, $remote, $localDir, [AbqCtl.XferProgress]::Callback)
+                            [AbqCtl.XferProgress]::SetPhase('done', '目录下载完成', $grand, $grand)
+                            Write-HostOk ("目录下载完成 remote={0} -> {1} ({2})" -f $remote, $localDir, $summary)
+                            [AbqCtl.XferProgress]::Clear()
                         }
                         default {
                             Write-HostErr ("unknown op: {0}" -f $req.op)
@@ -766,6 +839,29 @@ function Upload-LocalFile([string]$LocalPath, [string]$DestDir) {
     $out = Send-HostRequest @{ op = 'put'; local = $localFull; remote = $remote } 600
     Write-Host $out
     Write-Host "remote_path=$remote"
+}
+
+function Upload-LocalInpFolder([string]$LocalDir, [string]$DestDir) {
+    if (-not $LocalDir) { throw '用法: .\abqctl.ps1 upload-inps <本地文件夹> [远端目录]' }
+    if (-not (Test-Path -LiteralPath $LocalDir -PathType Container)) {
+        throw "本地文件夹不存在: $LocalDir"
+    }
+    $dirFull = (Resolve-Path -LiteralPath $LocalDir).Path
+    $dest = Normalize-RemotePath $(if ($DestDir) { $DestDir } else { $RemoteDir })
+    $files = @(Get-ChildItem -LiteralPath $dirFull -Filter '*.inp' -File)
+    if ($files.Count -eq 0) { throw "文件夹内没有 .inp: $dirFull" }
+    Write-Host ("将上传 {0} 个 .inp -> {1}" -f $files.Count, $dest)
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $files) {
+        $remote = "$dest/$($f.Name)"
+        Write-Host ("上传: {0}" -f $f.Name)
+        $out = Send-HostRequest @{ op = 'put'; local = $f.FullName; remote = $remote } 600
+        Write-Host $out
+        Write-Host "remote_path=$remote"
+        [void]$paths.Add($remote)
+    }
+    Write-Host ("UPLOAD_INPS_OK count={0}" -f $paths.Count)
+    Write-Host ('remote_paths=' + ($paths -join ';'))
 }
 
 function Download-RemoteFile([string]$RemotePath, [string]$LocalDir) {
@@ -829,16 +925,43 @@ fi
     Invoke-Remote ($script -replace "`r", '') 60
 }
 
+function List-RemoteInps([string]$RemoteDir) {
+    $dir = Normalize-RemotePath $(if ($RemoteDir) { $RemoteDir } else { '/public/home/tsyg/wh-data/hq' })
+    if ($dir -match '\.inp$') { $dir = ($dir -replace '/[^/]+$', '') }
+    $q = $dir -replace "'", "'\''"
+    $script = @"
+p='$q'
+if [ ! -d "`$p" ]; then
+  echo "不存在目录: `$p"
+  exit 1
+fi
+n=0
+paths=''
+for f in "`$p"/*.inp; do
+  [ -f "`$f" ] || continue
+  n=`$((n+1))
+  if [ -z "`$paths" ]; then paths="`$f"; else paths="`$paths;`$f"; fi
+  echo "inp=`$f"
+  if [ `$n -ge 200 ]; then break; fi
+done
+echo "LIST_INPS_OK dir=`$p count=`$n"
+echo "remote_paths=`$paths"
+"@
+    Invoke-Remote ($script -replace "`r", '') 60
+}
+
 function Show-Help {
     @"
 abqctl.ps1 — Windows 原生（SSH.NET，无 Python）
 
   .\abqctl.ps1 connect <6位动态码>
   .\abqctl.ps1 upload <本地文件> [远端目录]     # 默认远端 /public/home/tsyg/wh-data
+  .\abqctl.ps1 upload-inps <本地文件夹> [远端目录]  # 批量上传文件夹内全部 .inp
+  .\abqctl.ps1 list-inps [远端目录]            # 列出远端目录下全部 .inp（入队用）
   .\abqctl.ps1 browse [远端路径]               # 预览目录列表或文件前几行
-  .\abqctl.ps1 download <远端文件> <本地目录>
-  .\abqctl.ps1 download-dir <远端目录> <本地目录>
-  .\abqctl.ps1 run <远程.inp> [-Cpus 40] [-Double both]
+  .\abqctl.ps1 download <远端文件> <本地目录>   # 支持断点续传
+  .\abqctl.ps1 download-dir <远端目录> <本地目录> # 逐文件断点续传
+  .\abqctl.ps1 run <远程.inp> [-Cpus 40] [-Double both]  # 保留CLI；GUI 已改为只走队列
   .\abqctl.ps1 status [作业名|all]
   .\abqctl.ps1 sta <作业名>
   .\abqctl.ps1 log <作业名>
@@ -912,6 +1035,8 @@ bash $RemoteCtl status '$Arg1' | head -30
         Invoke-Remote "bash $RemoteCtl list-inputs '$d'"
     }
     'upload' { Upload-LocalFile -LocalPath $Arg1 -DestDir $(if ($Arg2) { $Arg2 } else { $RemoteDir }) }
+    'upload-inps' { Upload-LocalInpFolder -LocalDir $Arg1 -DestDir $(if ($Arg2) { $Arg2 } else { $RemoteDir }) }
+    'list-inps' { List-RemoteInps -RemoteDir $Arg1 }
     'browse' { Browse-RemotePath -RemotePath $Arg1 }
     'ls' { Browse-RemotePath -RemotePath $Arg1 }
     'download' { Download-RemoteFile -RemotePath $Arg1 -LocalDir $Arg2 }

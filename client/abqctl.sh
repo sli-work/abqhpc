@@ -20,7 +20,12 @@ job_name_from_inp() {
 find_job_dir() {
   local name=$1
   local cand
+  # Prefer per-job subfolder <parent>/<job_name>/ (new layout).
   for cand in \
+    "/public/home/tsyg/wh-data/hq/${name}" \
+    "/public/home/tsyg/wh-data/${name}" \
+    "/public/home/tsyg/tsyg/inputs/${name}" \
+    "/public/home/tsyg/tsyg/${name}" \
     "/public/home/tsyg/wh-data/hq" \
     "/public/home/tsyg/wh-data" \
     "/public/home/tsyg/tsyg/inputs" \
@@ -32,7 +37,7 @@ find_job_dir() {
     fi
   done
   local hit
-  hit=$(find /public/home/tsyg -maxdepth 4 \( -name "${name}.sta" -o -name "${name}.lck" -o -name "run_${name}.log" \) 2>/dev/null | head -1 || true)
+  hit=$(find /public/home/tsyg -maxdepth 5 \( -name "${name}.sta" -o -name "${name}.lck" -o -name "run_${name}.log" \) 2>/dev/null | head -1 || true)
   if [[ -n "$hit" ]]; then
     dirname "$hit"
     return 0
@@ -60,9 +65,15 @@ cmd_run() {
 
   [[ -r "$inp" ]] || die "inp not readable: $inp"
   inp=$(readlink -f "$inp")
-  local workdir job
-  workdir=$(dirname "$inp")
+  local parent workdir job
+  parent=$(dirname "$inp")
   job=$(job_name_from_inp "$inp")
+  # Per-job folder: <parent>/<job>/ ; reuse if .inp already inside that folder.
+  if [[ "$(basename "$parent")" == "$job" ]]; then
+    workdir=$parent
+  else
+    workdir=$parent/$job
+  fi
 
   source "$HOME/software/abaqus2020.env"
   command -v abaqus >/dev/null || die "abaqus not found"
@@ -74,6 +85,9 @@ cmd_run() {
   fi
 
   mkdir -p "$workdir/scratch"
+  if [[ "$inp" != "$workdir/${job}.inp" ]]; then
+    ln -sfn "$inp" "$workdir/${job}.inp" 2>/dev/null || cp -f "$inp" "$workdir/${job}.inp"
+  fi
   cd "$workdir"
   rm -f "${job}.lck" 2>/dev/null || true
 
@@ -91,7 +105,7 @@ cmd_run() {
   local pidfile="$workdir/run_${job}.pid"
 
   # Keep double=... on the abaqus command line (visible in ps / .com)
-  setsid nohup abaqus job="$job" input="$(basename "$inp")" \
+  setsid nohup abaqus job="$job" input="${job}.inp" \
     cpus="$cpus" mp_mode=threads \
     double="$double" \
     scratch="$workdir/scratch" \

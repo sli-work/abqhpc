@@ -27,9 +27,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-# Unified repo: abqhpc/client + abqhpc/remote
+# Unified repo: abqhpc/client + abqhpc/remote (also works if flat next to ../abqhpc/remote)
 $RepoRoot = Split-Path -Parent $ScriptDir
 $RemoteLocalDir = Join-Path $RepoRoot 'remote'
+if (-not (Test-Path $RemoteLocalDir)) {
+    $alt = Join-Path $RepoRoot 'abqhpc\remote'
+    if (Test-Path $alt) {
+        $RemoteLocalDir = $alt
+        $RepoRoot = Join-Path $RepoRoot 'abqhpc'
+    }
+}
 $StateDir = Join-Path $env:TEMP 'abqctl_ssh'
 $StateFile = Join-Path $StateDir 'session.json'
 
@@ -254,6 +261,63 @@ function Cancel-QueueJob([string]$Id) {
     Invoke-Db "cancel $Id"
 }
 
+function Stop-RemoteAbaqusJob([string]$JobName, [string]$Node) {
+    if (-not $JobName) { return }
+    $j = Escape-BashSingle $JobName
+    $n = Escape-BashSingle $Node
+    $hosts = if ($Node) { @($n) } else { @('login05', 'login08', 'login10') }
+    $hostList = ($hosts -join ' ')
+    $simple = @"
+JOB='$j'
+for h in $hostList; do
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no "`$h" \
+    "pkill -f 'analysis.pyc -job `$JOB' 2>/dev/null || true; \
+     pkill -f '/`$JOB\\.com' 2>/dev/null || true; \
+     pkill -f 'eliT_DriverLM -job `$JOB' 2>/dev/null || true; \
+     sleep 1; \
+     pkill -9 -f 'analysis.pyc -job `$JOB|/`$JOB\\.com|eliT_DriverLM -job `$JOB' 2>/dev/null || true" \
+    2>/dev/null || true
+done
+echo KILL_DONE job=`$JOB
+"@
+    Invoke-Remote $simple 60
+}
+
+function Stop-QueueJob([string]$Id) {
+    if (-not $Id) { throw '用法: .\AbqQueue.ps1 stop <id>' }
+    Sync-QueueRemote
+    $raw = Invoke-Db "stop $Id"
+    Write-Host $raw
+    try {
+        $line = ($raw -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        if (-not $line) { return }
+        $res = $line | ConvertFrom-Json
+        if ($res.ok -and $res.action -eq 'kill' -and $res.job_name) {
+            Write-Host ("正在终止远端进程 job={0} node={1}" -f $res.job_name, $res.node)
+            Stop-RemoteAbaqusJob -JobName ([string]$res.job_name) -Node ([string]$res.node)
+        }
+    }
+    catch {
+        Write-Host ("stop 后续处理: " + $_.Exception.Message)
+    }
+}
+
+function Delete-QueueJob([string]$Id) {
+    if (-not $Id) { throw '用法: .\AbqQueue.ps1 delete <id>' }
+    Sync-QueueRemote
+    # If still running, stop first then delete
+    $raw = Invoke-Db "get $Id"
+    try {
+        $line = ($raw -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $row = if ($line) { $line | ConvertFrom-Json } else { $null }
+        if ($row -and $row.status -in @('running', 'starting', 'waiting')) {
+            Stop-QueueJob -Id $Id | Out-Null
+        }
+    }
+    catch {}
+    Invoke-Db "delete $Id"
+}
+
 function Show-Nodes {
     Sync-QueueRemote
     $qd = Escape-BashSingle $QueueDir
@@ -281,7 +345,9 @@ AbqQueue.ps1 — 批量队列 / 调度器控制（依赖 abqctl_win 已连接会
   .\AbqQueue.ps1 sync                 # 上传 remote/* 到超算队列目录
   .\AbqQueue.ps1 enqueue <远程.inp> [-Cpus 8] [-Double both] [-Priority 0] [-Node login08]
   .\AbqQueue.ps1 list [status]
-  .\AbqQueue.ps1 cancel <id>
+  .\AbqQueue.ps1 cancel <id>          # 仅 waiting/starting
+  .\AbqQueue.ps1 stop <id>            # 排队取消；运行中则杀进程
+  .\AbqQueue.ps1 delete <id>          # 从队列删除（运行中会先 stop）
   .\AbqQueue.ps1 scheduler-status
   .\AbqQueue.ps1 scheduler-start [-Node login05]
   .\AbqQueue.ps1 scheduler-stop
@@ -304,6 +370,8 @@ switch ($Command) {
     'queue-list' { List-Queue }
     'cancel' { Cancel-QueueJob -Id $Arg1 }
     'queue-cancel' { Cancel-QueueJob -Id $Arg1 }
+    'stop' { Stop-QueueJob -Id $Arg1 }
+    'delete' { Delete-QueueJob -Id $Arg1 }
     'scheduler-status' { Show-SchedulerStatus }
     'scheduler-start' { Start-SchedulerRemote }
     'scheduler-stop' { Stop-SchedulerRemote }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Scan a login node for Abaqus processes and resource summary."""
-from __future__ import annotations
+"""Scan a login node for Abaqus processes. Compatible with Python 3.6+."""
+from __future__ import print_function
 
 import argparse
 import json
@@ -18,13 +18,13 @@ JOB_RE = re.compile(
 CPUS_RE = re.compile(r"\bcpus[= ](\d+)", re.I)
 
 
-def run(cmd: list[str], timeout: int = 30) -> str:
+def run(cmd, timeout=30):
     try:
         p = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            universal_newlines=True,
             timeout=timeout,
             check=False,
         )
@@ -33,11 +33,11 @@ def run(cmd: list[str], timeout: int = 30) -> str:
         return ""
 
 
-def hostname() -> str:
+def hostname():
     return run(["hostname"]).strip() or "unknown"
 
 
-def nproc() -> int:
+def nproc():
     out = run(["nproc"]).strip()
     try:
         return int(out)
@@ -45,14 +45,14 @@ def nproc() -> int:
         return 1
 
 
-def loadavg() -> str:
+def loadavg():
     try:
         return Path("/proc/loadavg").read_text(encoding="utf-8").split()[0]
     except Exception:
         return ""
 
 
-def mem_available_mb() -> int | None:
+def mem_available_mb():
     try:
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
             if line.startswith("MemAvailable:"):
@@ -63,8 +63,8 @@ def mem_available_mb() -> int | None:
     return None
 
 
-def parse_jobs_from_ps(ps_text: str) -> list[dict]:
-    jobs: dict[str, dict] = {}
+def parse_jobs_from_ps(ps_text):
+    jobs = {}
     for line in ps_text.splitlines():
         line = line.strip()
         if not line:
@@ -85,10 +85,9 @@ def parse_jobs_from_ps(ps_text: str) -> list[dict]:
             continue
         cmd = parts[1]
         m = JOB_RE.search(cmd)
-        job = m.group(1) if m else f"pid{pid}"
+        job = m.group(1) if m else ("pid%d" % pid)
         cm = CPUS_RE.search(cmd)
         cpus = int(cm.group(1)) if cm else 1
-        # explicit_dp often one process per job; keep max cpus estimate
         prev = jobs.get(job)
         if prev is None or cpus > prev.get("cpus", 0):
             jobs[job] = {
@@ -100,8 +99,7 @@ def parse_jobs_from_ps(ps_text: str) -> list[dict]:
     return list(jobs.values())
 
 
-def scan_local() -> dict:
-    # PID CMD
+def scan_local():
     ps = run(["ps", "-eo", "pid=,args="])
     jobs = parse_jobs_from_ps(ps)
     used = sum(int(j.get("cpus") or 1) for j in jobs)
@@ -116,14 +114,8 @@ def scan_local() -> dict:
     }
 
 
-def scan_remote(node: str) -> dict:
+def scan_remote(node):
     """Scan via ssh to node (BatchMode). Falls back to empty on failure."""
-    script = (
-        "python3 - <<'PY'\n"
-        + Path(__file__).read_text(encoding="utf-8")
-        + "\nprint(__import__('json').dumps(scan_local(), ensure_ascii=False))\nPY"
-    )
-    # Simpler: invoke this file remotely if deployed
     remote_py = os.environ.get(
         "ABQCTL_NODE_SCAN_PY",
         "/public/home/tsyg/tsyg/abqctl_queue/abqctl_node_scan.py",
@@ -137,7 +129,7 @@ def scan_remote(node: str) -> dict:
         "-o",
         "StrictHostKeyChecking=no",
         node,
-        f"python3 {remote_py} --local --json",
+        "python3 %s --local" % remote_py,
     ]
     out = run(cmd, timeout=40).strip()
     if not out:
@@ -151,7 +143,6 @@ def scan_remote(node: str) -> dict:
             "error": "ssh_scan_failed",
         }
     try:
-        # last JSON line
         line = out.strip().splitlines()[-1]
         data = json.loads(line)
         data["node"] = data.get("node") or node
@@ -169,7 +160,7 @@ def scan_remote(node: str) -> dict:
         }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("node", nargs="?", default="local")
     p.add_argument("--local", action="store_true")
