@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local / temp
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+*.swp
+
+# Secrets / local state (never commit)
+.env
+.env.*
+*.pem
+*.key
+pass.dat
+
+# Editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Build / packages
+*.zip
+dist/
+build/

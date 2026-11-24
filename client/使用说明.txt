@@ -1,0 +1,7 @@
+详见仓库 docs\使用说明.md 与根目录 README.md。
+
+快速：
+  1. .\abqctl.ps1 connect <6位动态码>
+  2. 单作业：双击「打开任务面板.bat」或 .\abqctl.ps1 gui
+  3. 批量：.\AbqQueue.ps1 sync → scheduler-start → enqueue / gui
+     或双击「打开队列面板.bat」

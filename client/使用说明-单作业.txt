@@ -1,0 +1,34 @@
+﻿超算 Abaqus 工具（Windows 原生版，无 Python）
+==========================================
+
+依赖
+- PowerShell 5.1+
+- 本目录 lib\Renci.SshNet.dll（已随包提供，用 SSH.NET 做密码/动态码登录）
+- 下载文件夹需要本机 tar.exe（Win10/11 一般自带）
+
+重要说明
+- 登录密码 = tsyg6100 + 6 位动态码。面板里只填动态码，不要加前缀。
+- 动态码不会写入磁盘。
+- connect 成功后保持一条 SSH/SFTP 会话，之后提交/状态/.sta/取消/上传下载都复用这条连接。
+- 默认远端目录：/public/home/tsyg/wh-data
+
+用法
+1. 双击「打开任务面板.bat」
+2. 输入动态码 -> 连接 / 保持会话
+3. 文件传输：
+   - 预览远端：列出目录内容；若是 .inp/.sta/.log 等则显示文件头
+   - 上传 inp：选本地 .inp，传到「远端路径」目录（可改成 hq 等子目录）
+   - 下载文件 / 下载文件夹：填远端路径，本地每次弹出文件夹选择框
+4. 填写远程 inp、CPU核数、double -> 提交运行
+5. 监控 .sta / 取消任务
+
+命令行
+  powershell -File .\abqctl.ps1 connect <6位动态码>
+  powershell -File .\abqctl.ps1 browse /public/home/tsyg/wh-data/hq
+  powershell -File .\abqctl.ps1 upload C:\path\a.inp [/public/home/tsyg/wh-data/hq]
+  powershell -File .\abqctl.ps1 download /public/home/tsyg/wh-data/hq/a.odb D:\save
+  powershell -File .\abqctl.ps1 download-dir /public/home/tsyg/wh-data/hq D:\save
+  powershell -File .\abqctl.ps1 run /path/x.inp -Cpus 40 -Double both
+  powershell -File .\abqctl.ps1 sta JOB
+  powershell -File .\abqctl.ps1 cancel JOB
+  powershell -File .\abqctl.ps1 disconnect
